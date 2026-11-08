@@ -993,10 +993,17 @@ BOOL KDUpMapDriverDirectVM(
             //
             // Wait for the shellcode to trigger the event
             //
-            if (WaitForSingleObject(ReadyEventHandle, 2000) != WAIT_OBJECT_0) {
+            if (WaitForSingleObject(ReadyEventHandle, 5000) != WAIT_OBJECT_0) {
 
                 supPrintfEvent(kduEventError,
-                    "[!] Shellcode did not trigger the event within two seconds.\r\n");
+                    "[!] Shellcode did not trigger the event within five seconds.\r\n");
+
+                /*
+                 * 超时也要读一次共享节：shellcode 在失败时同样会把 NTSTATUS 写进
+                 * PAYLOAD_HEADER，这是判断"它到底跑到哪一步"的唯一窗口。
+                 */
+                printf_s("[!] Payload result as left by the shellcode:\r\n");
+                KDUShowPayloadResult(Context, ScSectionHandle);
 
             }
             else
