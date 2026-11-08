@@ -34,3 +34,6 @@ BOOL KDUMapDriver(
 BOOL WINAPI KDUPagePatchCallback(
     _In_ ULONG_PTR Address,
     _In_ PVOID UserContext);
+
+/* 指定 shellcode 落点 RVA（0 = 由 KDU 自行选择）。 */
+VOID KDUSetStagerOffset(_In_ ULONG Offset);

