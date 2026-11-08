@@ -296,3 +296,20 @@ void KDUProvStopVulnerableDriver(
 
 BOOL WINAPI KDUValidatePrerequisitesForSuperfetch(
     _In_ PKDU_CONTEXT Context);
+
+//
+// Provider capability bits returned by KDUProvGetCapabilities.
+//
+#define KDU_CAP_READ_VM        0x00000001
+#define KDU_CAP_WRITE_VM       0x00000002
+#define KDU_CAP_VIRT2PHYS      0x00000004
+#define KDU_CAP_READ_PHYS      0x00000008
+#define KDU_CAP_WRITE_PHYS     0x00000010
+#define KDU_CAP_MAP_DRIVER     0x00000020
+#define KDU_CAP_CONTROL_DSE    0x00000040
+#define KDU_CAP_OPEN_PROCESS   0x00000080
+#define KDU_CAP_VALIDATE       0x00000100
+
+ULONG KDUProvGetCapabilities(
+    _In_ ULONG ProviderId
+);

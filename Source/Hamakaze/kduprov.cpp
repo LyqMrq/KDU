@@ -1,4 +1,4 @@
-﻿/*******************************************************************************
+/*******************************************************************************
 *
 *  (C) COPYRIGHT AUTHORS, 2020 - 2026
 *
@@ -643,6 +643,40 @@ static HINSTANCE KDUProviderLoadEmbeddedDb(
 * Load drivers database file or use embedded providers database.
 *
 */
+/*
+* KDUProvGetCapabilities
+*
+* Purpose:
+*
+* Report which callbacks the provider implements. KDUProviderCreate silently
+* returns NULL when the selected provider cannot satisfy the requested action, so
+* callers need a way to pick a provider that has the primitives they want
+* (for example ReadPhysicalMemory + VirtualToPhysical instead of plain VM access).
+*
+*/
+ULONG KDUProvGetCapabilities(
+    _In_ ULONG ProviderId
+)
+{
+    ULONG caps = 0;
+    PKDU_PROVIDER provider;
+
+    if (ProviderId >= RTL_NUMBER_OF(g_KDUProviders)) return 0;
+
+    provider = &g_KDUProviders[ProviderId];
+
+    if (provider->Callbacks.ReadKernelVM) caps |= KDU_CAP_READ_VM;
+    if (provider->Callbacks.WriteKernelVM) caps |= KDU_CAP_WRITE_VM;
+    if (provider->Callbacks.VirtualToPhysical) caps |= KDU_CAP_VIRT2PHYS;
+    if (provider->Callbacks.ReadPhysicalMemory) caps |= KDU_CAP_READ_PHYS;
+    if (provider->Callbacks.WritePhysicalMemory) caps |= KDU_CAP_WRITE_PHYS;
+    if (provider->Callbacks.MapDriver) caps |= KDU_CAP_MAP_DRIVER;
+    if (provider->Callbacks.ControlDSE) caps |= KDU_CAP_CONTROL_DSE;
+    if (provider->Callbacks.OpenProcess) caps |= KDU_CAP_OPEN_PROCESS;
+    if (provider->Callbacks.ValidatePrerequisites) caps |= KDU_CAP_VALIDATE;
+
+    return caps;
+}
 HINSTANCE KDUProviderLoadDB(
     VOID
 )
