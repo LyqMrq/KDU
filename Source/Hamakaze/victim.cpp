@@ -625,12 +625,26 @@ BOOL VpQueryInformation(
                     signatureSize);
 
                 if (ptrCode) {
-                    imageInfo->DispatchOffset = (ULONG_PTR)ptrCode & 0xffff;
+                    /*
+                     * DispatchOffset 是“签名在镜像中的 RVA”，drvmap 用它算
+                     * LoadedImageBase + DispatchOffset 作为补丁地址。
+                     * 原实现取 (ULONG_PTR)ptrCode & 0xffff，等于把 RVA 截断到 16 位：
+                     * 一旦签名落在 .text 的 64 KiB 之后，补丁就会写到错的位置，
+                     * 触发执行的是被写坏的其它代码（表现为 0x1E 非法指令/除零）。
+                     */
+                    ULONG_PTR imageBase = (ULONG_PTR)Context->Data.VictimImage;
+                    imageInfo->DispatchOffset = (ULONG)((ULONG_PTR)ptrCode - imageBase);
                     imageInfo->DispatchPageOffset = imageInfo->DispatchOffset & 0xfff;
 
                     LONG_PTR rel = (LONG_PTR)sectionBase - (LONG_PTR)ptrCode - 5;
 
                     imageInfo->JumpValue = (ULONG)rel;
+
+                    printf_s("[+] Victim dispatch: rva 0x%lX (image base 0x%p, section 0x%p), jump 0x%lX\r\n",
+                        imageInfo->DispatchOffset,
+                        (PVOID)imageBase,
+                        sectionBase,
+                        imageInfo->JumpValue);
                 }
                 else {
                     SetLastError(ERROR_NOT_FOUND);
