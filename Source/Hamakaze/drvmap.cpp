@@ -819,7 +819,13 @@ BOOL KDUpMapDriverPhysicalTranslate(
     //
     // 失败时还原被改写的 victim 代码，避免创建路径继续执行到 stager 区。
     //
-    if (!bSuccess) {
+    // 卸载触发模式下 victim 已经被卸载，它的代码页也随之消失：此时再去写回原始字节
+    // 会命中失效/只读地址，直接 0xBE（在虚拟机里实测过一次）。这种情况不还原。
+    //
+    if (!bSuccess && g_UnloadTrigger) {
+        printf_s("[~] Victim already unloaded by the trigger, skip restore\r\n");
+    }
+    else if (!bSuccess) {
 
         if (haveEntry &&
             WriteKernelVM(deviceHandle, TargetAddress, originalEntry, ScSize)) {
