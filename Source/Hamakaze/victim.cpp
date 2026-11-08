@@ -410,6 +410,14 @@ BOOL VpReleaseCallback(
 {
     BOOL bResult = FALSE;
 
+    /*
+     * 自定义 victim 用的是系统里已有的签名驱动，卸载后绝不能删除它的镜像文件。
+     */
+    if (g_CustomVictimPath[0] != 0) {
+
+        return NT_SUCCESS(VppLoadUnloadDriver(Name, g_CustomVictimPath, FALSE, TRUE, NULL, NULL));
+    }
+
     LPWSTR driverFileName = VppBuildDriverName(Name);
     if (driverFileName) {
         bResult = NT_SUCCESS(VppLoadUnloadDriver(Name, driverFileName, FALSE, TRUE, NULL, NULL));

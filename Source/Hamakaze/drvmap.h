@@ -37,3 +37,6 @@ BOOL WINAPI KDUPagePatchCallback(
 
 /* 指定 shellcode 落点 RVA（0 = 由 KDU 自行选择）。 */
 VOID KDUSetStagerOffset(_In_ ULONG Offset);
+
+/* TRUE = 用 DriverUnload 触发 stager，而不是打开 victim 设备。 */
+VOID KDUSetUnloadTrigger(_In_ BOOL Enable);
