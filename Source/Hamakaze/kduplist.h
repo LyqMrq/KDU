@@ -88,6 +88,21 @@ static KDU_VICTIM_PROVIDER g_KDUVictims[] = {
         VpExecuteCallback,                // Victim execute payload callback
         &g_ProcExpSig,                    // Victim dispatch bytes
         sizeof(g_ProcExpSig)              // Victim dispatch bytes size
+    },
+
+    {
+        (LPCWSTR)L"KduCustomVictim",      // 名称占位，实际路径/设备名由 VpSetCustomVictim 提供
+        (LPCWSTR)L"Caller supplied signed driver",   // Description
+        KDU_VICTIM_RESOURCE_CUSTOM,       // Resource id: sentinel, no database extraction
+        KDU_VICTIM_CUSTOM,                // Victim id
+        SYNCHRONIZE |
+        GENERIC_READ | GENERIC_WRITE,     // Desired access flags used for acquiring victim handle
+        KDU_VICTIM_FLAGS_SUPPORT_RELOAD,  // Victim flags, target dependent
+        VpCreateCallback,                 // Victim create callback
+        VpReleaseCallback,                // Victim release callback
+        VpExecuteCallback,                // Victim execute payload callback
+        NULL,                             // 无签名：派发 RVA 由调用方显式给出
+        0                                 // Victim dispatch bytes size
     }
 
 };

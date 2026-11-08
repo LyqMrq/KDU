@@ -82,8 +82,15 @@
 //
 #define KDU_VICTIM_PE1627  0
 #define KDU_VICTIM_PE1702  1
-#define KDU_VICTIM_MAX     2
+/*
+ * 自定义 victim：不占用数据库资源，由调用方在运行时提供镜像路径与设备名。
+ * 用于"系统里已经存在、但 KDU 数据库没有收录"的签名驱动（例如本次用 victim-scout
+ * 挑出的、创建派发之后还有 >=0x800 字节空间的驱动）。
+ */
+#define KDU_VICTIM_CUSTOM  2
+#define KDU_VICTIM_MAX     3
 #define KDU_VICTIM_DEFAULT KDU_VICTIM_PE1702
+#define KDU_VICTIM_RESOURCE_CUSTOM 0xFFFFFFFFul
 
 //
 // Companion id table

