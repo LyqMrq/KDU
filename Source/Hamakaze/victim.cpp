@@ -33,6 +33,61 @@
 */
 static WCHAR g_CustomVictimPath[MAX_PATH * 2];
 static WCHAR g_CustomVictimDevice[MAX_PATH];
+static BOOL g_CustomVictimLoadedByUs = FALSE;   /* TRUE = 本进程加载，卸载时需要停服务 */
+
+/*
+* VpCustomVictimIsLoaded
+*
+* Purpose:
+*
+* Check whether the caller supplied victim image is already running, by looking it up
+* in the loaded module list. Loading a second instance of an already running driver
+* makes its DriverEntry fail with STATUS_OBJECT_NAME_COLLISION and bugchecks with 0x121.
+*
+*/
+static BOOL VpCustomVictimIsLoaded(
+    _In_opt_ LPCWSTR ImagePath
+)
+{
+    PRTL_PROCESS_MODULES modulesList;
+    ANSI_STRING moduleName;
+    UNICODE_STRING unicodeName;
+    WCHAR baseName[MAX_PATH];
+    CHAR baseNameAnsi[MAX_PATH * 2];
+    LPCWSTR fileName;
+    LPWSTR extension;
+    BOOL found = FALSE;
+
+    if (ImagePath == NULL || ImagePath[0] == 0) return FALSE;
+
+    fileName = wcsrchr(ImagePath, L'\\');
+    fileName = (fileName != NULL) ? fileName + 1 : ImagePath;
+
+    StringCchCopyW(baseName, RTL_NUMBER_OF(baseName), fileName);
+    extension = wcsrchr(baseName, L'.');
+    if (extension) *extension = 0;
+
+    modulesList = (PRTL_PROCESS_MODULES)supGetLoadedModulesList(FALSE, NULL);
+    if (modulesList == NULL) return FALSE;
+
+    RtlInitUnicodeString(&unicodeName, baseName);
+    moduleName.Buffer = NULL;
+    moduleName.Length = moduleName.MaximumLength = 0;
+
+    if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&moduleName, &unicodeName, TRUE)) &&
+        moduleName.Buffer != NULL) {
+
+        StringCchPrintfA(baseNameAnsi, RTL_NUMBER_OF(baseNameAnsi), "%s.sys", moduleName.Buffer);
+        if (ntsupFindModuleEntryByName(modulesList, baseNameAnsi) != NULL) found = TRUE;
+
+        RtlFreeAnsiString(&moduleName);
+    }
+
+    supHeapFree(modulesList);
+
+    return found;
+}
+
 
 VOID VpSetCustomVictim(
     _In_opt_ LPCWSTR ImagePath,
@@ -268,6 +323,20 @@ BOOL VpCreateCallback(
              */
             if (ResourceId == KDU_VICTIM_RESOURCE_CUSTOM) {
 
+                /*
+                 * 如果这个驱动已经在运行（例如 cng.sys 这类常驻驱动），绝不能再加载一次：
+                 * 第二个实例会在 IoCreateDevice 处撞名（STATUS_OBJECT_NAME_COLLISION），
+                 * DriverEntry 返回失败后系统直接 0x121。直接复用现有实例即可。
+                 */
+                if (VpCustomVictimIsLoaded(g_CustomVictimPath)) {
+
+                    printf_s("[+] Custom victim already loaded, reusing the running instance\r\n");
+                    g_CustomVictimLoadedByUs = FALSE;
+                    SetLastError(ERROR_SUCCESS);
+                    bResult = TRUE;
+                    break;
+                }
+
                 if (g_CustomVictimPath[0] == 0 || !RtlDoesFileExists_U(g_CustomVictimPath)) {
 
                     supPrintfEvent(kduEventError,
@@ -287,6 +356,7 @@ BOOL VpCreateCallback(
                     CallbackParam);
 
                 if (NT_SUCCESS(ntStatus)) {
+                    g_CustomVictimLoadedByUs = TRUE;
                     SetLastError(ERROR_SUCCESS);
                     bResult = TRUE;
                 }
@@ -414,6 +484,12 @@ BOOL VpReleaseCallback(
      * 自定义 victim 用的是系统里已有的签名驱动，卸载后绝不能删除它的镜像文件。
      */
     if (g_CustomVictimPath[0] != 0) {
+
+        /* 复用的现有实例不是我们加载的，绝不能卸载它。 */
+        if (!g_CustomVictimLoadedByUs) {
+            printf_s("[~] Custom victim was not loaded by us, leave it running\r\n");
+            return TRUE;
+        }
 
         return NT_SUCCESS(VppLoadUnloadDriver(Name, g_CustomVictimPath, FALSE, TRUE, NULL, NULL));
     }
