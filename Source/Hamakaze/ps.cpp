@@ -409,6 +409,17 @@ BOOL KDUGetEprocessOffsets(
         break;
 
     default:
+        // 26H2 (26300+) 不在上表内：先按 24H2/25H2 的 EPROCESS 布局处理。
+        // 该假设由调用方的读回校验（ObjectTable -> HandleTableEntry -> GrantedAccess）
+        // 判定是否成立；区间之外的版本仍然直接拒绝，避免把内核写坏。
+        if (NtBuildNumber >= 26100 && NtBuildNumber < 26400) {
+            Offsets->PsProtectionOffset = PsProtectionOffset_26100;
+            Offsets->MitigationFlags1Offset = PsMitigationFlags1Offset_26100;
+            Offsets->MitigationFlags2Offset = PsMitigationFlags2Offset_26100;
+            Offsets->ObjectTableOffset = ObjectTableOffset_26100;
+            printf_s("[+] NT build %lu not in offset table; assuming 26100 layout\r\n", NtBuildNumber);
+            return TRUE;
+        }
         return FALSE;
     }
 
@@ -1167,26 +1178,19 @@ BOOL KDURunCommandInheritee(
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
-    // check if process can be started (no PPL) or created suspended to patch PPL
-    DWORD creationOptions;
-    if (PPLLevel > 0) {
-        wprintf_s(L"[+] Creating suspended Process '%s'\r\n", CommandLine);
-        creationOptions = CREATE_SUSPENDED;
-    }
-    else {
-        wprintf_s(L"[+] Creating Process '%s'\r\n", CommandLine);
-        creationOptions = NULL;
-    }
+    // 始终挂起创建：句柄要先交付到子进程并补权，才允许子进程开始执行。
+    DWORD creationOptions = CREATE_SUSPENDED;
+    wprintf_s(L"[+] Creating suspended Process '%s'\r\n", CommandLine);
 
     if (!CreateProcess(
         NULL,               // No module name (use command line)
         CommandLine,        // Command line
         NULL,               // Process handle not inheritable
         NULL,               // Thread handle not inheritable
-        TRUE,               // Do inherit inheritable handles
-        creationOptions,    // according to given PPL, see above
+        FALSE,              // no inheritance: the handle is duplicated explicitly below
+        creationOptions,
         NULL,               // Use parent's environment block
-        NULL,               // Use parent's starting directory 
+        NULL,               // Use parent's starting directory
         &si,                // Pointer to STARTUPINFO structure
         &pi))               // Pointer to PROCESS_INFORMATION structure
     {
@@ -1195,15 +1199,41 @@ BOOL KDURunCommandInheritee(
     }
     printf_s("[+] Created Process with PID %lu\r\n", pi.dwProcessId);
 
+    // Duplicate the target handle into the child explicitly (inheritance gets its
+    // access mask stripped by external object callbacks), then patch the child-side
+    // handle table entry to PROCESS_ALL_ACCESS.
+    HANDLE hChildTarget = NULL;
+    HANDLE hChildThread = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), hTargetProc, pi.hProcess, &hChildTarget,
+        0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        supShowWin32Error("[!] Failed to duplicate target handle into child", GetLastError());
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return FALSE;
+    }
+    printf_s("[+] Duplicated target handle into child as %p\r\n", hChildTarget);
+
+    ULONG_PTR childHandleTable = 0;
+    if (!KDUControlHandleAccess(Context, pi.dwProcessId, hChildTarget, PROCESS_ALL_ACCESS,
+        &childHandleTable)) {
+        supPrintfEvent(kduEventError,
+            "[!] Failed to set child-side handle access rights.\r\n");
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return FALSE;
+    }
+    printf_s("[+] Child-side handle access rights filled to PROCESS_ALL_ACCESS\r\n");
+
     if (PPLLevel >= 7) {
         PPLLevel = 7;
         printf_s("[!] Capped the PPL level at 7\r\n");
     }
 
-    // patch PPL and resume
+    // patch PPL if requested, then let the child run
     if (PPLLevel > 0 and PPLLevel < 8) {
 
-        DWORD dwThreadResumeCount = 0;
         PS_PROTECTED_SIGNER signer = (PS_PROTECTED_SIGNER)PPLLevel;
         PS_PROTECTED_TYPE type = PsProtectedTypeProtectedLight;
 
@@ -1214,8 +1244,10 @@ BOOL KDURunCommandInheritee(
             CloseHandle(pi.hThread);
             return FALSE;
         }
+    }
 
-        dwThreadResumeCount = ResumeThread(pi.hThread);
+    {
+        const DWORD dwThreadResumeCount = ResumeThread(pi.hThread);
         if (dwThreadResumeCount != 1) {
             supPrintfEvent(kduEventError,
                 "[!] Failed to resume process: %lu | 0x%lX\r\n", dwThreadResumeCount, GetLastError());
@@ -1226,8 +1258,32 @@ BOOL KDURunCommandInheritee(
         }
     }
 
-    // Wait until child process exits.
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    /*
+     * Handle guard.
+     *
+     * Observed on Windows build 26300 with EAC active: a handle table entry patched
+     * to PROCESS_ALL_ACCESS while the child is suspended is normalized back to the
+     * stripped mask (0x11F145) once the child starts executing. So patch again right
+     * after resume and keep re-checking for the first 30 seconds (300ms, then 5s).
+     * KDUControlHandleAccess compares the current mask first and only writes when it
+     * is insufficient, so repeating it is cheap.
+     */
+    ULONG_PTR guardTable = childHandleTable;
+    const DWORD guardStart = GetTickCount();
+    bool guardActive = true;
+    for (;;) {
+        const DWORD elapsed = GetTickCount() - guardStart;
+        if (guardActive && elapsed >= 30000) {
+            guardActive = false;
+            printf_s("[+] Handle guard finished after %lums\r\n", elapsed);
+        }
+        const DWORD interval = guardActive ? (elapsed < 5000 ? 300 : 5000) : INFINITE;
+        if (WaitForSingleObject(pi.hProcess, interval) == WAIT_OBJECT_0) break;
+        if (guardActive) {
+            KDUControlHandleAccess(Context, pi.dwProcessId, hChildTarget, PROCESS_ALL_ACCESS,
+                &guardTable);
+        }
+    }
 
     // Close process and thread handles.
     CloseHandle(pi.hProcess);
@@ -1235,3 +1291,4 @@ BOOL KDURunCommandInheritee(
 
     return TRUE;
 }
+
