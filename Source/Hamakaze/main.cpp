@@ -988,6 +988,7 @@ UINT KDUCheckAnotherInstance()
 */
 int main()
 {
+    setvbuf(stdout, NULL, _IONBF, 0); /* 诊断：崩溃时也要能看到最后一行输出 */
     HeapSetInformation(NULL, HeapEnableTerminationOnCorruption, NULL, 0);
     KDUIntroBanner();
 

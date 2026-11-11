@@ -1111,6 +1111,40 @@ BOOL KDUOpenAndPatchThreads(
 */
 static HANDLE g_runtimeHandlesMap = NULL;
 
+/* Re-check one child-side handle entry and only patch it when the mask lost bits.
+ * EAC normalizes handles right after the child resumes; this restores the delivered
+ * process/thread handles without spamming the full KDUControlHandleAccess transcript. */
+static void GuardChildHandleAccess(
+    _In_ PKDU_CONTEXT Context,
+    _In_ ULONG_PTR ChildPid,
+    _In_ HANDLE HandleValue,
+    _In_ ACCESS_MASK Required,
+    _Inout_ ULONG_PTR* ChildHandleTable)
+{
+    if (ChildHandleTable == nullptr || *ChildHandleTable == 0) return;
+
+    KDU_EPROCESS_OFFSETS offsets;
+    if (!KDUGetEprocessOffsets(Context->NtBuildNumber, &offsets) || !offsets.ObjectTableOffset)
+        return;
+
+    const ULONG_PTR entry = LookupHandleEntry(Context, *ChildHandleTable, HandleValue, offsets);
+    if (entry != 0) {
+        HANDLE_TABLE_ENTRY current = {};
+        if (Context->Provider->Callbacks.ReadKernelVM(Context->DeviceHandle, entry,
+                &current, sizeof(current))) {
+            if ((current.GrantedAccess & Required) == Required) return;
+        }
+    }
+
+    __try {
+        KDUControlHandleAccess(Context, ChildPid, HandleValue, Required, ChildHandleTable);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        printf_s("[!] Handle guard exception 0x%lx for handle %p\r\n",
+            GetExceptionCode(), HandleValue);
+    }
+}
+
 BOOL KDURunCommandInheritee(
     _In_ PKDU_CONTEXT Context,
     _In_ LPWSTR CommandLine,
@@ -1229,9 +1263,10 @@ BOOL KDURunCommandInheritee(
     }
     printf_s("[+] Child-side handle access rights filled to PROCESS_ALL_ACCESS\r\n");
 
-    /* Deliver one target thread handle too: user-mode injectors need it for
-     * APC delivery / thread hijacking when remote thread creation is denied. */
-    {
+    /* Deliver one target thread handle only when -pht was requested. The present
+     * path patches the D3D9 Present vtable externally and never touches a target
+     * thread; opening thread handles just gives EAC's handle scanner more to see. */
+    if (OpenThreads) {
         HANDLE hTargetThread = NULL;
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snapshot != INVALID_HANDLE_VALUE) {
@@ -1275,9 +1310,12 @@ BOOL KDURunCommandInheritee(
             } else {
                 printf_s("[!] Failed to set thread access rights, skipping thread delivery\r\n");
             }
+            CloseHandle(hTargetThread);
         } else {
             printf_s("[!] No target thread could be opened, skipping thread delivery\r\n");
         }
+    } else {
+        printf_s("[+] Skipping target thread delivery (no -pht)\r\n");
     }
 
     /* Publish the delivered handle values for the child. Enumerating handles from
@@ -1287,18 +1325,20 @@ BOOL KDURunCommandInheritee(
         wchar_t mapName[64];
         swprintf_s(mapName, L"Local\\AVAT-RT-%lu", pi.dwProcessId);
         HANDLE map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
-            sizeof(ULONG) * 2, mapName);
+            sizeof(ULONG) * 3, mapName);
         if (map) {
             const ULONG procValue = (ULONG)(ULONG_PTR)hChildTarget;
+            const ULONG threadCount = hChildThread ? 1 : 0;
             const ULONG threadValue = hChildThread ? (ULONG)(ULONG_PTR)hChildThread : 0;
-            void* view = MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(ULONG) * 2);
+            void* view = MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(ULONG) * 3);
             if (view) {
                 ULONG* slots = (ULONG*)view;
                 slots[0] = procValue;
-                slots[1] = threadValue;
+                slots[1] = threadCount;
+                slots[2] = threadValue;
                 UnmapViewOfFile(view);
-                printf_s("[+] Published runtime handles (proc=%lu thread=%lu) for child\r\n",
-                    procValue, threadValue);
+                printf_s("[+] Published runtime handles (proc=%lu threads=%lu thread=%lu) for child\r\n",
+                    procValue, threadCount, threadValue);
             }
             g_runtimeHandlesMap = map;   // must outlive the child's use of it
         }
@@ -1358,8 +1398,12 @@ BOOL KDURunCommandInheritee(
         const DWORD interval = guardActive ? (elapsed < 5000 ? 300 : 5000) : INFINITE;
         if (WaitForSingleObject(pi.hProcess, interval) == WAIT_OBJECT_0) break;
         if (guardActive) {
-            KDUControlHandleAccess(Context, pi.dwProcessId, hChildTarget, PROCESS_ALL_ACCESS,
-                &guardTable);
+            GuardChildHandleAccess(Context, pi.dwProcessId, hChildTarget,
+                PROCESS_ALL_ACCESS, &guardTable);
+            if (hChildThread) {
+                GuardChildHandleAccess(Context, pi.dwProcessId, hChildThread,
+                    THREAD_ALL_ACCESS, &guardTable);
+            }
         }
     }
 
