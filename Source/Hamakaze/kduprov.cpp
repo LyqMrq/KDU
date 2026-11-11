@@ -1092,7 +1092,16 @@ PKDU_CONTEXT WINAPI KDUProviderCreate(
         //
         // Check HVCI support.
         //
-        if (HvciEnabled && provLoadData->SupportHVCI == 0) {
+        // 65 = Adlice (RootLaser)：默认 DB 标志未声明 HVCI 支持，这里放行以便在开启
+        // HVCI 的实机上验证该 provider 的实际可用性（失败会在后续步骤如实报错）。
+        //
+        if (provLoadData->ProviderId == 65) {
+            if (HvciEnabled) {
+                supPrintfEvent(kduEventWarning,
+                    "[!] Provider 65 (Adlice) forced to run with HVCI enabled, expect failures\r\n");
+            }
+        }
+        else if (HvciEnabled && provLoadData->SupportHVCI == 0) {
 
             supPrintfEvent(kduEventError,
                 "[!] Abort: selected provider does not support HVCI\r\n");
